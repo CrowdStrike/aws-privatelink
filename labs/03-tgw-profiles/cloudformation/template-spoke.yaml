@@ -1,0 +1,411 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Lab 03 Spoke Account - TGW + Route 53 Profiles. Creates spoke VPC with TGW
+  attachment, local SSM/S3 endpoints, Route 53 Profile association, and test
+  instance with Falcon sensor.
+
+Parameters:
+  TgwId:
+    Type: String
+    Description: Transit Gateway ID from hub account
+
+  HubVpcCidr:
+    Type: String
+    Default: 10.70.0.0/16
+    Description: CIDR block of the hub VPC (for route and security group egress)
+
+  SensorBucketName:
+    Type: String
+    Description: S3 bucket name containing the Falcon sensor RPM
+
+  ProfileId:
+    Type: String
+    Description: Route 53 Profile ID from hub account
+
+  FalconCloud:
+    Type: String
+    Default: us-2
+    AllowedValues: [us-1, us-2, eu-1]
+    Description: CrowdStrike Falcon cloud
+
+  FalconCID:
+    Type: String
+    NoEcho: true
+    Description: CrowdStrike Falcon CID (with checksum)
+
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment name used as resource prefix
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+    Description: EC2 instance type
+
+  SensorS3Key:
+    Type: String
+    Default: falcon-sensor.rpm
+    Description: S3 object key for the Falcon sensor RPM
+
+  SpokeVpcCidr:
+    Type: String
+    Default: 10.71.0.0/16
+    Description: CIDR block for the spoke VPC
+
+Mappings:
+  CloudToHostnameSlug:
+    us-1: {Slug: b}
+    us-2: {Slug: gyr-maverick}
+    eu-1: {Slug: lanner-lion}
+
+Resources:
+  # Spoke VPC
+  SpokeVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref SpokeVpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-spoke-vpc
+
+  # Spoke private subnets
+  SpokeSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref SpokeVpc
+      CidrBlock: !Select [0, !Cidr [!Ref SpokeVpcCidr, 2, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-spoke-subnet-1
+
+  SpokeSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref SpokeVpc
+      CidrBlock: !Select [1, !Cidr [!Ref SpokeVpcCidr, 2, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-spoke-subnet-2
+
+  # Spoke route table
+  SpokeRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref SpokeVpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-spoke-rt
+
+  SpokeSubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SpokeSubnet1
+      RouteTableId: !Ref SpokeRouteTable
+
+  SpokeSubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SpokeSubnet2
+      RouteTableId: !Ref SpokeRouteTable
+
+  # TGW attachment
+  SpokeTGWAttachment:
+    Type: AWS::EC2::TransitGatewayAttachment
+    Properties:
+      TransitGatewayId: !Ref TgwId
+      VpcId: !Ref SpokeVpc
+      SubnetIds:
+        - !Ref SpokeSubnet1
+        - !Ref SpokeSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-spoke-attach
+
+  # Route to hub via TGW
+  SpokeToHubRoute:
+    Type: AWS::EC2::Route
+    DependsOn: SpokeTGWAttachment
+    Properties:
+      RouteTableId: !Ref SpokeRouteTable
+      DestinationCidrBlock: !Ref HubVpcCidr
+      TransitGatewayId: !Ref TgwId
+
+  # S3 gateway endpoint
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref SpokeVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref SpokeRouteTable
+
+  # Spoke endpoints security group
+  SpokeEndpointsSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${Environment}-spoke-endpoints
+      GroupDescription: HTTPS from spoke instance SG to local SSM endpoints
+      VpcId: !Ref SpokeVpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-spoke-endpoints
+
+  SpokeEndpointsSGIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SpokeEndpointsSG
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref InstanceSG
+      Description: HTTPS from spoke instance SG
+
+  # SSM interface endpoints
+  SSMEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref SpokeVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssm
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref SpokeSubnet1
+        - !Ref SpokeSubnet2
+      SecurityGroupIds:
+        - !Ref SpokeEndpointsSG
+      PrivateDnsEnabled: true
+
+  SSMMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref SpokeVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssmmessages
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref SpokeSubnet1
+        - !Ref SpokeSubnet2
+      SecurityGroupIds:
+        - !Ref SpokeEndpointsSG
+      PrivateDnsEnabled: true
+
+  EC2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref SpokeVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ec2messages
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref SpokeSubnet1
+        - !Ref SpokeSubnet2
+      SecurityGroupIds:
+        - !Ref SpokeEndpointsSG
+      PrivateDnsEnabled: true
+
+  # Route 53 Profile association
+  ProfileAssociation:
+    Type: AWS::Route53Profiles::ProfileAssociation
+    Properties:
+      Name: !Sub ${Environment}-spoke
+      ProfileId: !Ref ProfileId
+      ResourceId: !Ref SpokeVpc
+
+  # IAM role for instance
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Environment}-spoke-ec2-ssm
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: S3SensorRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListBucket
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource: !Sub arn:aws:s3:::${SensorBucketName}
+              - Sid: ReadObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub arn:aws:s3:::${SensorBucketName}/*
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${Environment}-spoke-ec2-ssm
+      Roles:
+        - !Ref InstanceRole
+
+  # Instance security group
+  InstanceSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${Environment}-spoke-instance
+      GroupDescription: Egress to SSM, S3, and hub endpoints
+      VpcId: !Ref SpokeVpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationSecurityGroupId: !Ref SpokeEndpointsSG
+          Description: HTTPS to local SSM endpoints
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref HubVpcCidr
+          Description: HTTPS to hub endpoint VPC via TGW
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-spoke-instance
+
+  # Lambda role for S3 prefix list lookup
+  PrefixListLookupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Environment}-prefix-list-lambda
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: describe-prefix-lists
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribePrefixLists
+                Resource: '*'
+
+  PrefixListLookupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${Environment}-prefix-list-lookup
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 128
+      Role: !GetAtt PrefixListLookupRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+              try:
+                  service_name = event['ResourceProperties']['ServiceName']
+                  ec2 = boto3.client('ec2')
+                  resp = ec2.describe_prefix_lists(
+                      Filters=[{'Name': 'prefix-list-name', 'Values': [service_name]}]
+                  )
+                  pl_id = resp['PrefixLists'][0]['PrefixListId']
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {'PrefixListId': pl_id})
+              except Exception as e:
+                  print(f'Error: {e}')
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  S3PrefixListLookup:
+    Type: Custom::PrefixListLookup
+    Properties:
+      ServiceToken: !GetAtt PrefixListLookupFunction.Arn
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+
+  InstanceSGEgressS3:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref InstanceSG
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationPrefixListId: !GetAtt S3PrefixListLookup.PrefixListId
+      Description: HTTPS to S3 gateway endpoint
+
+  # EC2 instance
+  Instance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - ProfileAssociation
+      - InstanceRole
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SpokeSubnet1
+      SecurityGroupIds:
+        - !Ref InstanceSG
+      IamInstanceProfile: !Ref InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 20
+            Encrypted: true
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 2
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            set -euxo pipefail
+            exec > /var/log/falcon-bootstrap.log 2>&1
+            echo "[$(date -Is)] bootstrap starting"
+            aws s3 cp "s3://${SensorBucketName}/${SensorS3Key}" /tmp/falcon-sensor.rpm --region "${AWS::Region}"
+            dnf install -y /tmp/falcon-sensor.rpm
+            /opt/CrowdStrike/falconctl -s --cid="${FalconCID}" --cloud="${FalconCloud}"
+            echo "[$(date -Is)] waiting for PrivateLink endpoint readiness"
+            for i in $(seq 1 30); do
+              if curl -so /dev/null --connect-timeout 3 https://${SensorProxyHost}:443 2>/dev/null; then
+                echo "[$(date -Is)] endpoint reachable after $i attempts"
+                break
+              fi
+              sleep 5
+            done
+            systemctl enable --now falcon-sensor
+            sleep 30
+            /opt/CrowdStrike/falconctl -g --aid || true
+            systemctl status falcon-sensor --no-pager || true
+            echo "[$(date -Is)] bootstrap complete"
+          - SensorProxyHost: !Sub
+              - ts01-${Slug}.cloudsink.net
+              - Slug: !FindInMap [CloudToHostnameSlug, !Ref FalconCloud, Slug]
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-spoke-instance
+
+Outputs:
+  InstanceId:
+    Description: EC2 instance ID
+    Value: !Ref Instance
+
+  SpokeVpcId:
+    Description: Spoke VPC ID
+    Value: !Ref SpokeVpc
+
+  SSMCommand:
+    Description: AWS CLI command to start SSM session
+    Value: !Sub aws ssm start-session --target ${Instance}

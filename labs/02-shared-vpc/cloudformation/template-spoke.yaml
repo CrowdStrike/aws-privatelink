@@ -1,0 +1,192 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Lab 02 Spoke Stack - EC2 instance in RAM-shared VPC subnets with
+  Falcon sensor installed at first boot.
+
+Parameters:
+  HubVpcId:
+    Type: String
+    Description: VPC ID from hub stack output
+
+  SubnetId1:
+    Type: String
+    Description: First subnet ID from hub stack
+
+  SubnetId2:
+    Type: String
+    Description: Second subnet ID from hub stack
+
+  EndpointsSgId:
+    Type: String
+    Description: Endpoints security group ID from hub stack
+
+  SensorBucketName:
+    Type: String
+    Description: S3 bucket name from hub stack
+
+  S3PrefixListId:
+    Type: String
+    Description: S3 prefix list ID from hub stack
+
+  FalconCloud:
+    Type: String
+    AllowedValues: [us-1, us-2, eu-1]
+    Default: us-2
+    Description: Your Falcon cloud (tenant region)
+
+  FalconCID:
+    Type: String
+    NoEcho: true
+    Description: Your Falcon CID (with checksum)
+
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment name prefix for resources
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+    Description: EC2 instance type
+
+  SensorS3Key:
+    Type: String
+    Default: falcon-sensor.rpm
+    Description: S3 object key for the sensor RPM
+
+Mappings:
+  CloudToHostnameSlug:
+    us-1: { Slug: b }
+    us-2: { Slug: gyr-maverick }
+    eu-1: { Slug: lanner-lion }
+
+Resources:
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${Environment}-02-spoke-host
+      GroupDescription: Egress to CrowdStrike endpoints and S3
+      VpcId: !Ref HubVpcId
+      SecurityGroupEgress:
+        - Description: HTTPS to CrowdStrike endpoints
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationSecurityGroupId: !Ref EndpointsSgId
+        - Description: HTTPS to S3
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationPrefixListId: !Ref S3PrefixListId
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-02-spoke-host
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Environment}-02-spoke-ec2-ssm
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: S3SensorRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListBucket
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource: !Sub arn:aws:s3:::${SensorBucketName}
+              - Sid: ReadObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub arn:aws:s3:::${SensorBucketName}/*
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${Environment}-02-spoke-ec2-ssm
+      Roles:
+        - !Ref InstanceRole
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId1
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            set -euxo pipefail
+
+            exec > /var/log/falcon-bootstrap.log 2>&1
+            echo "[$(date -Is)] bootstrap starting"
+
+            # 1. Pull the sensor RPM from S3 via the gateway endpoint
+            aws s3 cp "s3://${SensorBucketName}/${SensorS3Key}" /tmp/falcon-sensor.rpm --region ${AWS::Region}
+
+            # 2. Install
+            dnf install -y /tmp/falcon-sensor.rpm
+
+            # 3. Configure the sensor
+            /opt/CrowdStrike/falconctl -s --cid="${FalconCID}" --cloud="${FalconCloud}"
+
+            # 4. Wait for PrivateLink endpoint readiness
+            echo "[$(date -Is)] waiting for PrivateLink endpoint readiness"
+            for i in $(seq 1 30); do
+              if curl -so /dev/null --connect-timeout 3 https://${SensorProxyHost}:443 2>/dev/null; then
+                echo "[$(date -Is)] endpoint reachable after $i attempts"
+                break
+              fi
+              sleep 5
+            done
+
+            # 5. Start the sensor service
+            systemctl enable --now falcon-sensor
+
+            # 6. Emit verification data to the bootstrap log
+            sleep 30
+            /opt/CrowdStrike/falconctl -g --aid || true
+            systemctl status falcon-sensor --no-pager || true
+
+            echo "[$(date -Is)] bootstrap complete"
+          - SensorProxyHost: !Sub
+              - ts01-${Slug}.cloudsink.net
+              - Slug: !FindInMap [CloudToHostnameSlug, !Ref FalconCloud, Slug]
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 2
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 20
+            Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-sensor-host-0
+
+Outputs:
+  InstanceId:
+    Value: !Ref Instance
+    Description: EC2 instance ID
+
+  SSMCommand:
+    Value: !Sub aws ssm start-session --target ${Instance}
+    Description: Command to connect via Session Manager

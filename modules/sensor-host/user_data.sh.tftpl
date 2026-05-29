@@ -1,0 +1,38 @@
+#!/bin/bash
+# First-boot Falcon sensor install. Runs as root via cloud-init.
+# Inputs via templatefile(): bucket, sensor_rpm_key, falcon_cid,
+# falcon_cloud, region, sensor_proxy_host.
+set -euxo pipefail
+
+exec > /var/log/falcon-bootstrap.log 2>&1
+echo "[$(date -Is)] bootstrap starting"
+
+# 1. Pull the sensor RPM from S3 via the gateway endpoint (no internet egress).
+aws s3 cp "s3://${bucket}/${sensor_rpm_key}" /tmp/falcon-sensor.rpm --region "${region}"
+
+# 2. Install.
+dnf install -y /tmp/falcon-sensor.rpm
+
+# 3. Configure the sensor.
+/opt/CrowdStrike/falconctl -s --cid="${falcon_cid}" --cloud="${falcon_cloud}"
+
+# 4. Wait for PrivateLink endpoints to accept connections before starting
+#    the sensor. Avoids the fallback-to-public-IP timeout cycle.
+echo "[$(date -Is)] waiting for PrivateLink endpoint readiness"
+for i in $(seq 1 30); do
+  if curl -so /dev/null --connect-timeout 3 https://${sensor_proxy_host}:443 2>/dev/null; then
+    echo "[$(date -Is)] endpoint reachable after $i attempts"
+    break
+  fi
+  sleep 5
+done
+
+# 5. Start the sensor service.
+systemctl enable --now falcon-sensor
+
+# 6. Emit verification data to the bootstrap log.
+sleep 30
+/opt/CrowdStrike/falconctl -g --aid || true
+systemctl status falcon-sensor --no-pager || true
+
+echo "[$(date -Is)] bootstrap complete"

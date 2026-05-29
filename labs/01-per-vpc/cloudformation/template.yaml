@@ -1,0 +1,661 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CrowdStrike Falcon PrivateLink Lab 01 - Per-VPC endpoints.
+  Deploys a fully isolated VPC with CrowdStrike PrivateLink endpoints,
+  Route 53 private hosted zone, and a private EC2 instance running the
+  Falcon sensor with no internet connectivity.
+
+Parameters:
+  FalconCloud:
+    Type: String
+    Description: CrowdStrike Falcon cloud for this CID
+    AllowedValues:
+      - us-1
+      - us-2
+      - eu-1
+    Default: us-2
+
+  FalconClientId:
+    Type: String
+    Description: "CrowdStrike Falcon API client ID with Sensor Download: Read scope"
+    NoEcho: true
+
+  FalconClientSecret:
+    Type: String
+    Description: CrowdStrike Falcon API client secret
+    NoEcho: true
+
+  OwnerEmail:
+    Type: String
+    Description: Email address for resource ownership tag
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+
+  Environment:
+    Type: String
+    Description: Environment name for resource naming and tagging
+    Default: dev
+    AllowedPattern: '^[a-z0-9-]+$'
+
+  InstanceType:
+    Type: String
+    Description: EC2 instance type for the sensor host
+    Default: t3.small
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+
+  SensorS3Key:
+    Type: String
+    Description: S3 object key for the Falcon sensor RPM
+    Default: falcon-sensor.rpm
+
+Mappings:
+  CloudToHomeRegion:
+    us-1:
+      Region: us-west-1
+    us-2:
+      Region: us-west-2
+    eu-1:
+      Region: eu-central-1
+
+  CloudToEndpointServices:
+    us-1:
+      SensorProxy: com.amazonaws.vpce.us-west-1.vpce-svc-08744dea97b26db5d
+      DownloadServer: com.amazonaws.vpce.us-west-1.vpce-svc-0f9d8ca86ddcb7106
+      UploadServer: com.amazonaws.vpce.us-west-1.vpce-svc-0fa888d7b9e4130f4
+    us-2:
+      SensorProxy: com.amazonaws.vpce.us-west-2.vpce-svc-08a5bb05d337fd834
+      DownloadServer: com.amazonaws.vpce.us-west-2.vpce-svc-0e11def2d8620ae74
+      UploadServer: com.amazonaws.vpce.us-west-2.vpce-svc-074a82fde584744da
+    eu-1:
+      SensorProxy: com.amazonaws.vpce.eu-central-1.vpce-svc-0eb7b6ca4b7271385
+      DownloadServer: com.amazonaws.vpce.eu-central-1.vpce-svc-0340142b9ab8fc564
+      UploadServer: com.amazonaws.vpce.eu-central-1.vpce-svc-0148ff0159e9419dd
+
+  CloudToHostnameSlug:
+    us-1:
+      Slug: b
+    us-2:
+      Slug: gyr-maverick
+    eu-1:
+      Slug: lanner-lion
+
+Conditions:
+  IsCrossRegion: !Not
+    - !Equals
+      - !Ref AWS::Region
+      - !FindInMap [CloudToHomeRegion, !Ref FalconCloud, Region]
+
+Resources:
+  # ============================================================================
+  # S3 Bucket for Sensor RPM
+  # ============================================================================
+
+  SensorBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${Environment}-falcon-sensor-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-falcon-sensor-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref OwnerEmail
+
+  # ============================================================================
+  # Lambda Custom Resource for Sensor RPM Fetch
+  # ============================================================================
+
+  SensorFetchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-sensor-fetch-lambda'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: s3-upload
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub '${SensorBucket.Arn}/*'
+
+  SensorFetchFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-sensor-fetch'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 512
+      Role: !GetAtt SensorFetchRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import urllib.request
+          import urllib.parse
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+
+              try:
+                  props = event['ResourceProperties']
+                  client_id = props['FalconClientId']
+                  client_secret = props['FalconClientSecret']
+                  falcon_cloud = props['FalconCloud']
+                  bucket = props['BucketName']
+                  s3_key = props['S3Key']
+                  region = props['Region']
+
+                  # Determine Falcon API base URL
+                  api_base = {
+                      'us-1': 'https://api.crowdstrike.com',
+                      'us-2': 'https://api.us-2.crowdstrike.com',
+                      'eu-1': 'https://api.eu-1.crowdstrike.com',
+                  }[falcon_cloud]
+
+                  # Authenticate
+                  auth_data = urllib.parse.urlencode({
+                      'client_id': client_id,
+                      'client_secret': client_secret,
+                  }).encode()
+                  auth_req = urllib.request.Request(
+                      f'{api_base}/oauth2/token',
+                      data=auth_data,
+                      method='POST',
+                  )
+                  auth_req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+                  with urllib.request.urlopen(auth_req) as resp:
+                      token = json.loads(resp.read())['access_token']
+
+                  # Get CID
+                  cid_req = urllib.request.Request(f'{api_base}/sensors/queries/installers/ccid/v1')
+                  cid_req.add_header('Authorization', f'Bearer {token}')
+                  with urllib.request.urlopen(cid_req) as resp:
+                      cid = json.loads(resp.read())['resources'][0]
+
+                  # Find latest AL2023 x86_64 sensor
+                  filter_str = urllib.parse.quote("os:\"Amazon Linux\" + os_version:\"2023\" + architectures:\"x86_64\"")
+                  sensor_req = urllib.request.Request(
+                      f'{api_base}/sensors/combined/installers/v2?filter={filter_str}&sort=version|desc&limit=1'
+                  )
+                  sensor_req.add_header('Authorization', f'Bearer {token}')
+                  with urllib.request.urlopen(sensor_req) as resp:
+                      sensor_info = json.loads(resp.read())['resources'][0]
+                      sha256 = sensor_info['sha256']
+
+                  # Download sensor RPM
+                  dl_req = urllib.request.Request(
+                      f'{api_base}/sensors/entities/download-installer/v2?id={sha256}'
+                  )
+                  dl_req.add_header('Authorization', f'Bearer {token}')
+                  with urllib.request.urlopen(dl_req) as resp:
+                      rpm_data = resp.read()
+
+                  # Upload to S3
+                  s3 = boto3.client('s3', region_name=region)
+                  s3.put_object(Bucket=bucket, Key=s3_key, Body=rpm_data)
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'CID': cid,
+                      'BucketName': bucket,
+                      'S3Key': s3_key,
+                  })
+              except Exception as e:
+                  print(f'Error: {e}')
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  SensorFetch:
+    Type: Custom::SensorFetch
+    DependsOn: SensorBucket
+    Properties:
+      ServiceToken: !GetAtt SensorFetchFunction.Arn
+      FalconClientId: !Ref FalconClientId
+      FalconClientSecret: !Ref FalconClientSecret
+      FalconCloud: !Ref FalconCloud
+      BucketName: !Ref SensorBucket
+      S3Key: !Ref SensorS3Key
+      Region: !Ref AWS::Region
+
+  # ============================================================================
+  # VPC and Networking
+  # ============================================================================
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.50.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-falcon-privatelink-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref OwnerEmail
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.50.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-falcon-privatelink-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref OwnerEmail
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.50.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-falcon-privatelink-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref OwnerEmail
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-falcon-privatelink-rt'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref OwnerEmail
+
+  SubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref RouteTable
+
+  SubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref RouteTable
+
+  # ============================================================================
+  # Security Groups
+  # ============================================================================
+
+  EndpointsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for VPC endpoints
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.50.0.0/16
+          Description: Allow HTTPS from VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-falcon-endpoints-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref OwnerEmail
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for sensor host instance
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTPS outbound (no IGW - traffic stays within VPC/endpoints)
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-falcon-instance-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref OwnerEmail
+
+  # ============================================================================
+  # VPC Endpoints
+  # ============================================================================
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref RouteTable
+
+  SSMEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref EndpointsSecurityGroup
+
+  SSMMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref EndpointsSecurityGroup
+
+  EC2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref EndpointsSecurityGroup
+
+  # CrowdStrike PrivateLink Endpoints
+
+  SensorProxyEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !FindInMap [CloudToEndpointServices, !Ref FalconCloud, SensorProxy]
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: false
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref EndpointsSecurityGroup
+      ServiceRegion: !If
+        - IsCrossRegion
+        - !FindInMap [CloudToHomeRegion, !Ref FalconCloud, Region]
+        - !Ref AWS::NoValue
+
+  DownloadServerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !FindInMap [CloudToEndpointServices, !Ref FalconCloud, DownloadServer]
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: false
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref EndpointsSecurityGroup
+      ServiceRegion: !If
+        - IsCrossRegion
+        - !FindInMap [CloudToHomeRegion, !Ref FalconCloud, Region]
+        - !Ref AWS::NoValue
+
+  UploadServerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !FindInMap [CloudToEndpointServices, !Ref FalconCloud, UploadServer]
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: false
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref EndpointsSecurityGroup
+      ServiceRegion: !If
+        - IsCrossRegion
+        - !FindInMap [CloudToHomeRegion, !Ref FalconCloud, Region]
+        - !Ref AWS::NoValue
+
+  # ============================================================================
+  # Route 53 Private Hosted Zone
+  # ============================================================================
+
+  PrivateHostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: cloudsink.net
+      VPCs:
+        - VPCId: !Ref VPC
+          VPCRegion: !Ref AWS::Region
+      HostedZoneConfig:
+        Comment: !Sub 'Private hosted zone for ${Environment} Falcon PrivateLink'
+      HostedZoneTags:
+        - Key: Name
+          Value: !Sub '${Environment}-falcon-phz'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref OwnerEmail
+
+  SensorProxyRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: !Sub
+        - 'ts01-${Slug}.cloudsink.net'
+        - Slug: !FindInMap [CloudToHostnameSlug, !Ref FalconCloud, Slug]
+      Type: A
+      AliasTarget:
+        DNSName: !Select [1, !Split [':', !Select [0, !GetAtt SensorProxyEndpoint.DnsEntries]]]
+        HostedZoneId: !Select [0, !Split [':', !Select [0, !GetAtt SensorProxyEndpoint.DnsEntries]]]
+        EvaluateTargetHealth: false
+
+  DownloadServerRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: !Sub
+        - 'lfodown01-${Slug}.cloudsink.net'
+        - Slug: !FindInMap [CloudToHostnameSlug, !Ref FalconCloud, Slug]
+      Type: A
+      AliasTarget:
+        DNSName: !Select [1, !Split [':', !Select [0, !GetAtt DownloadServerEndpoint.DnsEntries]]]
+        HostedZoneId: !Select [0, !Split [':', !Select [0, !GetAtt DownloadServerEndpoint.DnsEntries]]]
+        EvaluateTargetHealth: false
+
+  UploadServerRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: !Sub
+        - 'lfoup01-${Slug}.cloudsink.net'
+        - Slug: !FindInMap [CloudToHostnameSlug, !Ref FalconCloud, Slug]
+      Type: A
+      AliasTarget:
+        DNSName: !Select [1, !Split [':', !Select [0, !GetAtt UploadServerEndpoint.DnsEntries]]]
+        HostedZoneId: !Select [0, !Split [':', !Select [0, !GetAtt UploadServerEndpoint.DnsEntries]]]
+        EvaluateTargetHealth: false
+
+  # ============================================================================
+  # IAM Role and Instance Profile
+  # ============================================================================
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-falcon-sensor-host-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: S3SensorDownload
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub '${SensorBucket.Arn}/${SensorS3Key}'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt SensorBucket.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-falcon-sensor-host-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref OwnerEmail
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${Environment}-falcon-sensor-host-profile'
+      Roles:
+        - !Ref InstanceRole
+
+  # ============================================================================
+  # EC2 Instance
+  # ============================================================================
+
+  SensorHost:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - SensorFetch
+      - SensorProxyEndpoint
+      - DownloadServerEndpoint
+      - UploadServerEndpoint
+      - SensorProxyRecord
+      - DownloadServerRecord
+      - UploadServerRecord
+      - SSMEndpoint
+      - SSMMessagesEndpoint
+      - EC2MessagesEndpoint
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SubnetId: !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      UserData:
+        Fn::Base64:
+          Fn::Sub:
+            - |
+              #!/bin/bash
+              set -euxo pipefail
+              exec > /var/log/falcon-bootstrap.log 2>&1
+
+              echo "[$(date -Is)] bootstrap starting"
+
+              # Download sensor RPM from S3
+              aws s3 cp "s3://${BucketName}/${SensorS3Key}" /tmp/falcon-sensor.rpm --region ${AWS::Region}
+
+              # Install the sensor
+              dnf install -y /tmp/falcon-sensor.rpm
+
+              # Configure the sensor
+              /opt/CrowdStrike/falconctl -s --cid="${CID}" --cloud="${FalconCloud}"
+
+              # Wait for PrivateLink endpoint readiness
+              echo "[$(date -Is)] waiting for PrivateLink endpoint readiness"
+              SLUG=${HostnameSlug}
+              for i in $(seq 1 30); do
+                if curl -so /dev/null --connect-timeout 3 "https://ts01-${!SLUG}.cloudsink.net:443" 2>/dev/null; then
+                  echo "[$(date -Is)] endpoint reachable after $i attempts"
+                  break
+                fi
+                sleep 5
+              done
+
+              # Start the sensor service
+              systemctl enable --now falcon-sensor
+
+              # Wait for registration and log AID
+              sleep 30
+              /opt/CrowdStrike/falconctl -g --aid || true
+
+              echo "[$(date -Is)] bootstrap complete"
+            - BucketName: !GetAtt SensorFetch.BucketName
+              CID: !GetAtt SensorFetch.CID
+              HostnameSlug: !FindInMap [CloudToHostnameSlug, !Ref FalconCloud, Slug]
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-falcon-sensor-host'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref OwnerEmail
+
+Outputs:
+  VpcId:
+    Description: VPC ID
+    Value: !Ref VPC
+
+  InstanceId:
+    Description: EC2 instance ID for the sensor host
+    Value: !Ref SensorHost
+
+  FalconCID:
+    Description: CrowdStrike Customer ID extracted from the Falcon API
+    Value: !GetAtt SensorFetch.CID
+
+  SensorBucketName:
+    Description: S3 bucket containing the Falcon sensor RPM
+    Value: !Ref SensorBucket
+
+  SSMCommand:
+    Description: Command to start an SSM session to the sensor host
+    Value: !Sub 'aws ssm start-session --target ${SensorHost}'
