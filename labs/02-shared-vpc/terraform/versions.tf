@@ -4,7 +4,7 @@ terraform {
   required_providers {
     aws = {
       source                = "hashicorp/aws"
-      version               = ">= 5.80"
+      version               = ">= 5.82"
       configuration_aliases = [aws.hub, aws.spoke]
     }
     local = {
